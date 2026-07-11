@@ -1,0 +1,93 @@
+name: Issue 1 diagnostics
+
+on:
+  push:
+    branches:
+      - diagnostics/issue-1
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect reported log and published jar
+        env:
+          LOG_URL: https://api.mclo.gs/1/raw/vhB7kj8
+          RELEASE_API: https://api.github.com/repos/Vendetta1871/Caves-Not-Cliffs/releases/tags/release
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import subprocess
+          import tempfile
+          import urllib.request
+          import zipfile
+
+          def get(url, accept=None):
+              headers = {"User-Agent": "caves-not-cliffs-issue-1-diagnostics"}
+              if accept:
+                  headers["Accept"] = accept
+              with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
+                  return response.read()
+
+          raw = get(os.environ["LOG_URL"])
+          print("LOG sha256=" + hashlib.sha256(raw).hexdigest() + " bytes=" + str(len(raw)))
+          lines = raw.decode("utf-8", "replace").splitlines()
+          needles = re.compile(
+              r"(cavesnotcliffs|caves not cliffs|net\.celestiald|NoSuch(?:Field|Method|Class)|"
+              r"LoaderException|ModCrash|MixinApply|MixinTransformer|Caused by:|\bROCK\b)",
+              re.IGNORECASE,
+          )
+          selected = set()
+          for index, line in enumerate(lines):
+              if needles.search(line):
+                  selected.update(range(max(0, index - 3), min(len(lines), index + 5)))
+          print("LOG selected exception context:")
+          previous = -2
+          for index in sorted(selected)[:500]:
+              if index > previous + 1:
+                  print("...")
+              print(f"{index + 1}: {lines[index]}")
+              previous = index
+
+          release = json.loads(get(os.environ["RELEASE_API"], "application/vnd.github+json"))
+          jars = [asset for asset in release.get("assets", []) if asset["name"].lower().endswith(".jar")]
+          if len(jars) != 1:
+              raise RuntimeError("expected exactly one release jar, found " + repr([a["name"] for a in jars]))
+          asset = jars[0]
+          jar = get(asset["browser_download_url"], "application/octet-stream")
+          print("JAR name=" + asset["name"] + " api_size=" + str(asset["size"])
+                + " bytes=" + str(len(jar)) + " sha256=" + hashlib.sha256(jar).hexdigest())
+
+          candidates = []
+          with zipfile.ZipFile(io.BytesIO(jar)) as archive:
+              for entry in archive.infolist():
+                  if entry.filename.endswith(".class"):
+                      data = archive.read(entry)
+                      if b"ROCK" in data:
+                          candidates.append((entry.filename, data))
+          print("JAR classes containing literal ROCK=" + repr([name for name, _ in candidates]))
+          with tempfile.TemporaryDirectory() as temp:
+              for number, (name, data) in enumerate(candidates):
+                  path = os.path.join(temp, str(number) + ".class")
+                  with open(path, "wb") as output:
+                      output.write(data)
+                  result = subprocess.run(
+                      ["javap", "-verbose", "-p", path],
+                      check=True,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                  ).stdout.splitlines()
+                  print("JAVAP " + name)
+                  for index, line in enumerate(result):
+                      if "ROCK" in line:
+                          for context in result[max(0, index - 2):index + 3]:
+                              print(context)
+          PY
